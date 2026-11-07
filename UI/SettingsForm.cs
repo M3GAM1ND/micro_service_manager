@@ -16,18 +16,18 @@ internal sealed class SettingsForm : Form
     private readonly ChoiceCard _lite = new()
     {
         Title = "Fast & light  (recommended)",
-        Description = "Builds each service, then runs the compiled app directly. Same behavior, about 4× less memory than dotnet run.",
+        Description = "Builds, then runs the compiled app directly. Same behavior, about 4× less memory.",
     };
     private readonly ChoiceCard _dotnetRun = new()
     {
         Title = "dotnet run",
-        Description = "Exactly what a terminal does. Use this if a service behaves differently in fast mode.",
+        Description = "Exactly what a terminal does. Use it if a service acts differently in fast mode.",
     };
     private readonly ChoiceCard _lowMemory = new()
     {
         IsRadio = false,
         Title = "Low-memory mode",
-        Description = "Runs services with Workstation GC instead of Server GC. Much less RAM per service; no difference for local work.",
+        Description = "Runs services with Workstation GC instead of Server GC: much less RAM, no difference for local work.",
     };
     private readonly FlatButton _editProfiles = new() { Text = "Edit environments", Icon = Theme.IconEdit };
     private readonly FlatButton _openData = new() { Kind = ButtonKind.Ghost, Text = "Open data folder", Icon = Theme.IconFolder };
@@ -48,7 +48,7 @@ internal sealed class SettingsForm : Form
         MinimizeBox = false;
         ShowInTaskbar = firstRun;
         StartPosition = firstRun ? FormStartPosition.CenterScreen : FormStartPosition.CenterParent;
-        ClientSize = new Size(S(660), S(790));
+        ClientSize = new Size(S(660), S(600)); // height is fitted to the content in BuildLayout()
         AcceptButton = null;
 
         _env.Text = settings.EnvFilePath;
@@ -78,7 +78,7 @@ internal sealed class SettingsForm : Form
     private void BuildLayout()
     {
         int left = S(32), width = ClientSize.Width - left * 2;
-        int y = S(26);
+        int y = S(24);
 
         Label Add(string text, Font font, Color color, int height)
         {
@@ -88,12 +88,12 @@ internal sealed class SettingsForm : Form
             return label;
         }
 
-        Add(_firstRun ? "Welcome" : "Settings", Theme.Display(16f), Theme.Text, S(36));
+        Add(_firstRun ? "Welcome" : "Settings", Theme.Display(16f), Theme.Text, S(34));
         Add(_firstRun
                 ? "Pick your Angular environment file and your microservices folder. You can change these any time."
                 : "Paths, and how services run on your machine.",
-            Theme.Ui(9.5f), Theme.TextMuted, S(26));
-        y += S(18);
+            Theme.Ui(9.5f), Theme.TextMuted, S(22));
+        y += S(14);
 
         void PathRow(string title, string hint, TextField field, FlatButton browse)
         {
@@ -104,52 +104,68 @@ internal sealed class SettingsForm : Form
             Controls.Add(field);
             Controls.Add(browse);
             y += S(42);
-            Add(hint, Theme.Ui(8.75f), Theme.TextFaint, S(22));
-            y += S(14);
+            Add(hint, Theme.Ui(8.75f), Theme.TextFaint, S(20));
+            y += S(10);
         }
 
         PathRow("ANGULAR ENVIRONMENT FILE", "Usually src\\environments\\environment.ts. Only the URLs that need to change are edited.", _env, _browseEnv);
-        PathRow("MICROSERVICES FOLDER", "Every project under this folder with Properties\\launchSettings.json shows up as a service.", _root, _browseRoot);
+        PathRow("MICROSERVICES FOLDER", "Every project here with Properties\\launchSettings.json shows up as a service.", _root, _browseRoot);
 
-        Add("RUN SERVICES WITH", Theme.UiSemibold(8f), Theme.TextFaint, S(24));
-        foreach (var card in new[] { _lite, _dotnetRun, _lowMemory })
-        {
-            if (card == _lowMemory) y += S(8);
-            card.SetBounds(left, y, width, S(70));
-            Controls.Add(card);
-            y += S(78);
-        }
+        Add("RUN SERVICES WITH", Theme.UiSemibold(8f), Theme.TextFaint, S(22));
+        int half = (width - S(10)) / 2;
+        _lite.SetBounds(left, y, half, S(88));
+        _dotnetRun.SetBounds(left + half + S(10), y, width - half - S(10), S(88));
+        Controls.Add(_lite);
+        Controls.Add(_dotnetRun);
+        y += S(98);
+        _lowMemory.SetBounds(left, y, width, S(72));
+        Controls.Add(_lowMemory);
+        y += S(86);
 
-        y += S(8);
         Add("ENVIRONMENTS", Theme.UiSemibold(8f), Theme.TextFaint, S(22));
-        Add("QA, UAT1 and UAT3 URLs live in environments.json on your PC (not in Git). Changes apply as soon as you save the file.",
-            Theme.Ui(8.75f), Theme.TextMuted, S(38));
+        Add("QA, UAT1 and UAT3 live in environments.json on your PC (not in Git). Saved changes apply right away.",
+            Theme.Ui(8.75f), Theme.TextMuted, S(20));
+        y += S(6);
         _editProfiles.Width = _editProfiles.PreferredWidth();
         _openData.Width = _openData.PreferredWidth();
         _editProfiles.Location = new Point(left, y);
         _openData.Location = new Point(left + _editProfiles.Width + S(8), y);
         Controls.Add(_editProfiles);
         Controls.Add(_openData);
+        y += _editProfiles.Height + S(40);
 
-        int bottom = ClientSize.Height - S(24);
         _save.Width = Math.Max(S(96), _save.PreferredWidth());
         _cancel.Width = Math.Max(S(96), _cancel.PreferredWidth());
-        _save.Location = new Point(left + width - _save.Width, bottom - _save.Height);
-        _cancel.Location = new Point(_save.Left - S(8) - _cancel.Width, bottom - _cancel.Height);
-        _error.SetBounds(left, _save.Top, _cancel.Left - left - S(12), _save.Height);
+        _save.Location = new Point(left + width - _save.Width, y);
+        _cancel.Location = new Point(_save.Left - S(8) - _cancel.Width, y);
+        _error.SetBounds(left, y, _cancel.Left - left - S(12), _save.Height);
         _error.TextAlign = ContentAlignment.MiddleLeft;
         _error.Font = Theme.Ui(9f);
         Controls.Add(_error);
         Controls.Add(_cancel);
         Controls.Add(_save);
+        y += _save.Height + S(22);
+
+        // Fit the screen: on small or highly scaled displays the dialog scrolls instead of running off-screen.
+        var area = Screen.FromPoint(Cursor.Position).WorkingArea;
+        int chrome = Height - ClientSize.Height;
+        int height = Math.Min(y, area.Height - chrome - S(8));
+        if (height < y) AutoScroll = true;
+        ClientSize = new Size(ClientSize.Width + (AutoScroll ? SystemInformation.VerticalScrollBarWidth : 0), height);
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
         using var pen = new Pen(Theme.Border);
-        int y = _save.Top - S(18);
+        int y = _save.Top - S(20);
         e.Graphics.DrawLine(pen, 0, y, ClientSize.Width, y);
+    }
+
+    protected override void OnScroll(ScrollEventArgs se)
+    {
+        base.OnScroll(se);
+        Invalidate();
     }
 
     private void BrowseEnv()

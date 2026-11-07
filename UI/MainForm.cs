@@ -50,8 +50,11 @@ internal sealed class MainForm : Form
         Text = "Microservice Manager";
         AutoScaleMode = AutoScaleMode.None; // sizes are already DPI-scaled in code
         StartPosition = FormStartPosition.CenterScreen;
-        Size = new Size(LogicalToDeviceUnits(1280), LogicalToDeviceUnits(820));
-        MinimumSize = new Size(LogicalToDeviceUnits(960), LogicalToDeviceUnits(600));
+        // Never start bigger than the screen (e.g. 150% scaling on a 1080p display).
+        var area = Screen.FromPoint(Cursor.Position).WorkingArea;
+        MinimumSize = new Size(Math.Min(LogicalToDeviceUnits(960), area.Width), Math.Min(LogicalToDeviceUnits(600), area.Height));
+        Size = new Size(Math.Min(LogicalToDeviceUnits(1280), area.Width - LogicalToDeviceUnits(24)),
+                        Math.Min(LogicalToDeviceUnits(820), area.Height - LogicalToDeviceUnits(24)));
         KeyPreview = true;
 
         BuildHeader();
@@ -183,8 +186,8 @@ internal sealed class MainForm : Form
         _split.BackColor = Theme.Background;
         _split.Panel1.BackColor = Theme.Background;
         _split.Panel2.BackColor = Theme.Background;
-        _split.Panel1MinSize = S(170);
-        _split.Panel2MinSize = S(130);
+        // Panel min sizes are applied in ApplySavedSplitter(), once the window has its real size:
+        // setting them now (while the control is still 150×100) throws at 125%+ display scaling.
         _split.TabStop = false;
         _split.Paint += (_, e) =>
         {
@@ -602,11 +605,20 @@ internal sealed class MainForm : Form
 
     private void ApplySavedSplitter()
     {
-        int logHeight = _ws.Settings.Window?.LogPanelHeight ?? 0;
-        if (logHeight <= 0) logHeight = (int)(_split.Height * 0.38);
-        int distance = _split.Height - logHeight - _split.SplitterWidth;
-        if (distance > _split.Panel1MinSize && distance < _split.Height - _split.Panel2MinSize)
-            _split.SplitterDistance = distance;
+        int S(int v) => LogicalToDeviceUnits(v);
+        try
+        {
+            int available = _split.Height - _split.SplitterWidth;
+            int min1 = Math.Min(S(170), available / 2), min2 = Math.Min(S(130), available / 2);
+            int logHeight = _ws.Settings.Window?.LogPanelHeight ?? 0;
+            if (logHeight <= 0) logHeight = (int)(_split.Height * 0.38);
+            logHeight = Math.Clamp(logHeight, min2, Math.Max(min2, available - min1));
+
+            _split.SplitterDistance = Math.Max(min1, available - logHeight);
+            _split.Panel1MinSize = min1;
+            _split.Panel2MinSize = min2;
+        }
+        catch (InvalidOperationException) { /* window too small for the preferred sizes; WinForms defaults are fine */ }
     }
 
     private void SavePlacement()
