@@ -1,242 +1,661 @@
-﻿using System.ComponentModel;
 using System.Diagnostics;
-using MicroserviceManager.Models;
-using MicroserviceManager.Services;
+using MicroserviceManager.Core;
+using MicroserviceManager.UI.Controls;
 
-namespace MicroserviceManager.UI
+namespace MicroserviceManager.UI;
+
+internal sealed class MainForm : Form
 {
-    public class MainForm : Form
+    private readonly Workspace _ws;
+
+    private readonly HeaderBar _header = new();
+    private readonly FlatButton _rescan = new() { Kind = ButtonKind.Ghost, Icon = Theme.IconSync, Text = "Rescan" };
+    private readonly FlatButton _settings = new() { Kind = ButtonKind.Ghost, Icon = Theme.IconSettings, Text = "Settings" };
+
+    private readonly SmoothPanel _toolbar = new();
+    private readonly Label _envLabel = SmallLabel("REMOTE");
+    private readonly SegmentedControl _envSwitch = new();
+    private readonly Label _dbLabel = SmallLabel("DATABASE");
+    private readonly TextField _database = new() { Placeholder = "Database name" };
+    private readonly TextField _search = new() { Icon = Theme.IconSearch, Placeholder = "Filter services   Ctrl+F" };
+    private readonly FlatButton _lastSession = new() { Kind = ButtonKind.Ghost, Icon = Theme.IconHistory, Text = "Last session" };
+    private readonly FlatButton _startLocal = new() { Kind = ButtonKind.Primary, Icon = Theme.IconPlay, Text = "Start local" };
+    private readonly FlatButton _stopAll = new() { Kind = ButtonKind.Danger, Icon = Theme.IconStop, Text = "Stop all" };
+
+    private readonly SplitContainer _split = new();
+    private readonly ServiceListView _list = new();
+    private readonly LogHeader _logHeader = new();
+    private readonly LogView _log = new();
+    private readonly FooterBar _status = new();
+
+    private readonly ContextMenuStrip _rowMenu = new() { Renderer = new DarkMenuRenderer(), ShowImageMargin = false };
+    private readonly ToolTip _tips = new() { InitialDelay = 400 };
+    private readonly System.Windows.Forms.Timer _uiTimer = new() { Interval = 150 };
+    private readonly System.Windows.Forms.Timer _metricsTimer = new() { Interval = 2000 };
+
+    private FileSystemWatcher? _profilesWatcher;
+    private volatile bool _profilesChanged;
+    private DateTime _profilesChangedAt;
+    private long _seenVersion = -1;
+    private int _seenSignature;
+    private bool _showActivity = true;
+    private bool _initialized;
+    private bool _closing;
+
+    public MainForm(Workspace workspace)
     {
-        private readonly UserSettings _settings;
-        private readonly SettingsManager _settingsManager = new();
-        private readonly MicroserviceScanner _scanner = new();
-        private readonly ProcessManager _processManager = new();
-        private readonly DatabaseManager _databaseManager = new();
-        private EnvironmentManager _envManager;
-        private BindingList<Microservice> _services = new();
+        _ws = workspace;
+        SuspendLayout();
+        Theme.StyleWindow(this);
+        Text = "Microservice Manager";
+        AutoScaleMode = AutoScaleMode.None; // sizes are already DPI-scaled in code
+        StartPosition = FormStartPosition.CenterScreen;
+        Size = new Size(LogicalToDeviceUnits(1280), LogicalToDeviceUnits(820));
+        MinimumSize = new Size(LogicalToDeviceUnits(960), LogicalToDeviceUnits(600));
+        KeyPreview = true;
 
-        private CheckedListBox clbServices = new();
-        private Label lblStatus = new();
-        private RadioButton rbQa = new();
-        private RadioButton rbUat = new();
-        private TextBox txtDatabase = new();
-        private ContextMenuStrip _contextMenu = new();
+        BuildHeader();
+        BuildToolbar();
+        var content = BuildContent();
+        _status.Dock = DockStyle.Bottom;
+        _status.Height = LogicalToDeviceUnits(34);
+        _status.NoticeClicked += () => ShowActivity(true);
 
-        public MainForm(UserSettings settings)
+        // Docking order: the fill control first, then edges from the inside out.
+        Controls.Add(content);
+        Controls.Add(_status);
+        Controls.Add(_toolbar);
+        Controls.Add(_header);
+        ResumeLayout(true);
+
+        _uiTimer.Tick += (_, _) => RefreshUi(force: false);
+        _metricsTimer.Tick += (_, _) => _ws.SampleMetrics();
+        RestorePlacement();
+    }
+
+    // ================================================================== building the window
+
+    private static Label SmallLabel(string text) => new()
+    {
+        Text = text,
+        AutoSize = true,
+        Font = Theme.UiSemibold(8f),
+        ForeColor = Theme.TextFaint,
+        BackColor = Color.Transparent,
+    };
+
+    private void BuildHeader()
+    {
+        _header.Dock = DockStyle.Top;
+        _header.Height = LogicalToDeviceUnits(70);
+        _header.Controls.Add(_rescan);
+        _header.Controls.Add(_settings);
+        _header.Layout += (_, _) =>
         {
-            _settings = settings;
-            _envManager = new EnvironmentManager(_settings.EnvFilePath);
-            InitializeUI();
-            LoadServices();
-        }
-
-        private void InitializeUI()
-        {
-            Text = "Local Microservices Manager";
-            Size = new Size(800, 720);
-            StartPosition = FormStartPosition.CenterScreen;
-
-            Controls.Add(new Label { Text = "LOCAL MICROSERVICES", Location = new Point(20, 20), AutoSize = true, Font = new Font("Segoe UI", 12, FontStyle.Bold) });
-
-            Controls.Add(new Label { Text = "Unchecked Services Target:", Location = new Point(20, 62), AutoSize = true });
-            rbQa = new RadioButton { Text = "QA", Location = new Point(220, 60), AutoSize = true };
-            rbUat = new RadioButton { Text = "UAT", Location = new Point(280, 60), AutoSize = true };
-
-            if (_settings.RemoteEnvironment == "UAT") rbUat.Checked = true;
-            else rbQa.Checked = true;
-            Controls.Add(rbQa); Controls.Add(rbUat);
-
-            Controls.Add(new Label { Text = "Target Database Name:", Location = new Point(20, 95), AutoSize = true });
-            txtDatabase = new TextBox { Location = new Point(220, 92), Width = 300, Text = _settings.DatabaseName };
-            Controls.Add(txtDatabase);
-
-            // Tip Label for Visual Studio
-            Controls.Add(new Label { Text = "💡 Tip: Right-click a service to open it in Visual Studio", Location = new Point(20, 120), AutoSize = true, ForeColor = Color.DimGray });
-
-            clbServices = new CheckedListBox { Location = new Point(20, 140), Size = new Size(740, 360), Font = new Font("Consolas", 10) };
-            clbServices.ItemCheck += ClbServices_ItemCheck;
-
-            // Setup Context Menu for Visual Studio
-            var openVsItem = new ToolStripMenuItem("Open in Visual Studio 2026");
-            openVsItem.Click += OpenVsItem_Click;
-            _contextMenu.Items.Add(openVsItem);
-            clbServices.ContextMenuStrip = _contextMenu;
-            clbServices.MouseDown += ClbServices_MouseDown;
-
-            Controls.Add(clbServices);
-
-            var btnApplyRun = new Button { Text = "▶ APPLY & RUN", Location = new Point(20, 520), Size = new Size(150, 40), BackColor = Color.LightGreen };
-            btnApplyRun.Click += BtnApplyRun_Click;
-            Controls.Add(btnApplyRun);
-
-            var btnStopAll = new Button { Text = "■ STOP ALL", Location = new Point(190, 520), Size = new Size(120, 40), BackColor = Color.LightCoral };
-            btnStopAll.Click += BtnStopAll_Click;
-            Controls.Add(btnStopAll);
-
-            lblStatus = new Label { Location = new Point(20, 580), Size = new Size(740, 80), Font = new Font("Segoe UI", 9) };
-            Controls.Add(lblStatus);
-
-            FormClosing += MainForm_FormClosing;
-        }
-
-        private void LoadServices()
-        {
-            lblStatus.Text = "Scanning...";
-            var found = _scanner.ScanFolder(_settings.MicroservicesRootPath);
-
-            _databaseManager.EnsureBackups(found);
-
-            _services.Clear();
-            clbServices.Items.Clear();
-
-            foreach (var svc in found)
+            int x = _header.Width - LogicalToDeviceUnits(18);
+            foreach (var b in new[] { _settings, _rescan })
             {
-                _services.Add(svc);
-                UpdateListboxItem(svc);
+                b.Width = b.PreferredWidth();
+                x -= b.Width;
+                b.Location = new Point(x, (_header.Height - b.Height) / 2);
+                x -= LogicalToDeviceUnits(4);
             }
+        };
+        _rescan.Click += (_, _) => Rescan();
+        _settings.Click += (_, _) => OpenSettings();
+        _tips.SetToolTip(_rescan, "Scan the services folder again (F5)");
+    }
 
-            lblStatus.Text = $"✓ {found.Count} microservices discovered and backed up safely.";
+    private void BuildToolbar()
+    {
+        _toolbar.Dock = DockStyle.Top;
+        _toolbar.Height = LogicalToDeviceUnits(58);
+        foreach (Control c in new Control[] { _envLabel, _envSwitch, _dbLabel, _database, _search, _lastSession, _startLocal, _stopAll })
+            _toolbar.Controls.Add(c);
+        _toolbar.Layout += (_, _) => LayoutToolbar();
+
+        _envSwitch.SelectedIndexChanged += (_, _) =>
+        {
+            if (_envSwitch.SelectedItem is { } env) Guard(() => _ws.SetEnvironment(env));
+        };
+        _database.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode != Keys.Enter) return;
+            e.SuppressKeyPress = true;
+            CommitDatabase();
+            _list.Focus();
+        };
+        _database.Leave += (_, _) => CommitDatabase();
+        _search.TextChanged += (_, _) => ApplyFilter();
+        _search.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Escape) { _search.Text = ""; e.SuppressKeyPress = true; }
+        };
+        _startLocal.Click += (_, _) => StartLocal();
+        _stopAll.Click += async (_, _) => await GuardAsync(_ws.StopAllAsync);
+        _lastSession.Click += (_, _) => Guard(_ws.StartLastSession);
+
+        _tips.SetToolTip(_envSwitch, "Where Angular sends requests for services that aren't running locally");
+        _tips.SetToolTip(_database, "Database used by services running locally (press Enter to apply)");
+        _tips.SetToolTip(_startLocal, "Start every ticked service that isn't running yet");
+        _tips.SetToolTip(_stopAll, "Stop everything and put environment.ts and appsettings back to your repo's values");
+    }
+
+    private void LayoutToolbar()
+    {
+        int S(int v) => LogicalToDeviceUnits(v);
+        int h = _toolbar.Height;
+        int Center(Control c) => (h - c.Height) / 2;
+
+        int x = S(20);
+        _envLabel.Location = new Point(x, Center(_envLabel));
+        x += _envLabel.Width + S(10);
+        _envSwitch.Location = new Point(x, Center(_envSwitch));
+        x += _envSwitch.Width + S(26);
+        _dbLabel.Location = new Point(x, Center(_dbLabel));
+        x += _dbLabel.Width + S(10);
+        _database.SetBounds(x, (h - S(34)) / 2, S(200), S(34));
+        x += _database.Width + S(16);
+
+        int right = _toolbar.Width - S(20);
+        foreach (var b in new[] { _stopAll, _startLocal, _lastSession })
+        {
+            if (!b.Visible) continue;
+            b.Width = b.PreferredWidth();
+            right -= b.Width;
+            b.Location = new Point(right, Center(b));
+            right -= S(8);
         }
 
-        private void UpdateListboxItem(Microservice svc)
-        {
-            string remoteEnv = rbUat.Checked ? "UAT" : "QA";
-            string statusTag = svc.IsLocalSelected ? "LOCAL" : remoteEnv;
-            string displayText = $"{svc.Name,-20} | {svc.EnvVariableName,-20} | [{statusTag}] | {svc.Status}";
+        int searchW = Math.Clamp(right - S(8) - x, S(120), S(300));
+        _search.SetBounds(x, (h - S(34)) / 2, searchW, S(34));
+    }
 
-            int index = _services.IndexOf(svc);
-            if (clbServices.Items.Count > index)
+    private Control BuildContent()
+    {
+        int S(int v) => LogicalToDeviceUnits(v);
+        var content = new SmoothPanel { Dock = DockStyle.Fill, Padding = new Padding(S(18), S(2), S(18), S(4)) };
+
+        _split.Dock = DockStyle.Fill;
+        _split.Orientation = Orientation.Horizontal;
+        _split.FixedPanel = FixedPanel.Panel2;
+        _split.SplitterWidth = S(12);
+        _split.BackColor = Theme.Background;
+        _split.Panel1.BackColor = Theme.Background;
+        _split.Panel2.BackColor = Theme.Background;
+        _split.Panel1MinSize = S(170);
+        _split.Panel2MinSize = S(130);
+        _split.TabStop = false;
+        _split.Paint += (_, e) =>
+        {
+            var r = _split.SplitterRectangle;
+            int w = S(44);
+            Theme.Smooth(e.Graphics);
+            Theme.FillRound(e.Graphics, Theme.BorderStrong, new RectangleF(r.X + (r.Width - w) / 2f, r.Y + r.Height / 2f - S(2), w, S(4)), S(2));
+        };
+
+        var listCard = new Card { Dock = DockStyle.Fill, Padding = new Padding(S(6)) };
+        _list.Dock = DockStyle.Fill;
+        listCard.Controls.Add(_list);
+        _split.Panel1.Controls.Add(listCard);
+
+        var logCard = new Card { Dock = DockStyle.Fill, Padding = new Padding(S(6)) };
+        _log.Dock = DockStyle.Fill;
+        _logHeader.Dock = DockStyle.Top;
+        _logHeader.Height = S(46);
+        logCard.Controls.Add(_log);
+        logCard.Controls.Add(_logHeader);
+        _split.Panel2.Controls.Add(logCard);
+        content.Controls.Add(_split);
+
+        _list.EmptyText = "Scanning your services…";
+        _list.ToggleLocal += svc => Guard(() => _ws.SetLocal(svc, !svc.IsLocal));
+        _list.ToggleAll += local => Guard(() => _ws.SetLocal(FilteredServices(), local));
+        _list.SelectionChanged += svc => ShowLogsFor(svc);
+        _list.ActionClicked += OnRowAction;
+        _list.MenuRequested += ShowRowMenu;
+
+        _log.EmptyText = "Output from the selected service appears here.";
+        _log.FollowChanged += () => _logHeader.Follow.Toggled = _log.Follow;
+        _log.ClearRequested += ClearShownLog;
+        _logHeader.Follow.Click += (_, _) => _log.Follow = !_log.Follow;
+        _logHeader.ErrorsOnly.Click += (_, _) => { _log.ErrorsOnly = !_log.ErrorsOnly; _logHeader.ErrorsOnly.Toggled = _log.ErrorsOnly; };
+        _logHeader.Copy.Click += (_, _) => { _log.CopySelection(); _status.SetNotice(_log.HasSelection ? "Copied selected lines." : "Copied the whole log.", false); };
+        _logHeader.Clear.Click += (_, _) => ClearShownLog();
+        _logHeader.Activity.Click += (_, _) => ShowActivity(!_showActivity);
+        _tips.SetToolTip(_logHeader.Activity, "What the manager did: files changed, keys matched, warnings");
+        _tips.SetToolTip(_logHeader.ErrorsOnly, "Only errors and warnings");
+        _tips.SetToolTip(_logHeader.Follow, "Keep scrolling to the newest output");
+        _tips.SetToolTip(_logHeader.Copy, "Copy selected lines (or everything)");
+        _tips.SetToolTip(_logHeader.Clear, "Clear this output");
+        return content;
+    }
+
+    // ================================================================== startup
+
+    protected override async void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        ApplySavedSplitter();
+        _header.Subtitle = _ws.Settings.MicroservicesRootPath;
+        _log.Buffer = _ws.ActivityLog;
+        _toolbar.Enabled = false;
+        try
+        {
+            await Task.Run(_ws.Initialize);
+        }
+        catch (Exception ex)
+        {
+            _status.SetNotice("Startup problem: " + ex.Message, true);
+        }
+        _toolbar.Enabled = true;
+        _initialized = true;
+
+        _database.Text = _ws.Settings.DatabaseName;
+        PopulateEnvironments();
+        WatchProfiles();
+        RefreshUi(force: true);
+        _uiTimer.Start();
+        _metricsTimer.Start();
+        _list.Focus();
+    }
+
+    private void PopulateEnvironments()
+    {
+        var names = _ws.Profiles.Select(p => p.Name).ToList();
+        if (!names.SequenceEqual(_envSwitch.Items)) _envSwitch.Items = names;
+        _envSwitch.SelectedIndex = names.FindIndex(n => string.Equals(n, _ws.CurrentProfile.Name, StringComparison.OrdinalIgnoreCase));
+        LayoutToolbar();
+    }
+
+    /// <summary>environments.json is re-read as soon as you save it.</summary>
+    private void WatchProfiles()
+    {
+        try
+        {
+            _profilesWatcher = new FileSystemWatcher(AppPaths.DataFolder, Path.GetFileName(AppPaths.EnvironmentsFile))
             {
-                clbServices.Items[index] = displayText;
-                clbServices.SetItemChecked(index, svc.IsLocalSelected);
-            }
-            else clbServices.Items.Add(displayText, svc.IsLocalSelected);
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName,
+                EnableRaisingEvents = true,
+            };
+            FileSystemEventHandler changed = (_, _) => { _profilesChangedAt = DateTime.Now; _profilesChanged = true; };
+            _profilesWatcher.Changed += changed;
+            _profilesWatcher.Created += changed;
+            _profilesWatcher.Renamed += (_, _) => { _profilesChangedAt = DateTime.Now; _profilesChanged = true; };
+        }
+        catch { /* optional */ }
+    }
+
+    // ================================================================== refresh loop
+
+    private void RefreshUi(bool force)
+    {
+        if (_closing) return;
+
+        if (_profilesChanged && (DateTime.Now - _profilesChangedAt).TotalMilliseconds > 400)
+        {
+            _profilesChanged = false;
+            Guard(() =>
+            {
+                _ws.LoadProfiles();
+                _ws.ApplyRouting();
+                PopulateEnvironments();
+                _status.SetNotice("environments.json reloaded and applied.", false);
+            });
         }
 
-        private void ClbServices_ItemCheck(object? sender, ItemCheckEventArgs e)
+        long version = _ws.Version;
+        int signature = StateSignature();
+        if (force || version != _seenVersion || signature != _seenSignature)
         {
-            var svc = _services[e.Index];
-            svc.IsLocalSelected = e.NewValue == CheckState.Checked;
-            BeginInvoke(new Action(() => UpdateListboxItem(svc)));
+            _seenVersion = version;
+            _seenSignature = signature;
+            if (_list.Selected != null && !_ws.Services.Contains(_list.Selected)) _list.Selected = null;
+            ApplyFilter();
+            UpdateToolbarState();
+            UpdateLogHeader();
+            UpdateTotals();
+            if (_envSwitch.SelectedItem is { } shown && !string.Equals(shown, _ws.CurrentProfile.Name, StringComparison.OrdinalIgnoreCase))
+                PopulateEnvironments();
+        }
+        else if (_ws.Services.Any(s => s.State is ServiceState.Building or ServiceState.Starting or ServiceState.Queued or ServiceState.Stopping))
+        {
+            _list.Invalidate(); // pulse animation
         }
 
-        // Detect right-clicks to select the specific service
-        private void ClbServices_MouseDown(object? sender, MouseEventArgs e)
+        _log.Poll();
+        while (_ws.TryDequeueNotice(out var notice)) _status.SetNotice(notice.Text, notice.IsError);
+        _status.Tick();
+    }
+
+    private int StateSignature()
+    {
+        int h = 17;
+        foreach (var s in _ws.Services)
+            h = unchecked(h * 31 + (int)s.State * 4 + (s.IsLocal ? 1 : 0) + (s.InVisualStudio ? 2 : 0));
+        return h;
+    }
+
+    private List<ServiceInfo> FilteredServices()
+    {
+        string q = _search.Text.Trim();
+        if (q.Length == 0) return _ws.Services;
+        return _ws.Services.Where(s =>
+            s.Name.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+            (s.EnvKey?.Contains(q, StringComparison.OrdinalIgnoreCase) ?? false) ||
+            s.LocalUrl.Contains(q, StringComparison.OrdinalIgnoreCase)).ToList();
+    }
+
+    private void ApplyFilter()
+    {
+        _list.RemoteName = _ws.CurrentProfile.Name;
+        _list.EmptyText = !_initialized ? "Scanning your services…"
+            : _ws.Services.Count == 0
+                ? $"No services found in {_ws.Settings.MicroservicesRootPath}\n\nEach service needs Properties\\launchSettings.json with a \"Project\" profile.\nCheck Settings, or press F5 to scan again."
+                : "No services match your filter.";
+        _list.SetItems(FilteredServices());
+    }
+
+    private void UpdateToolbarState()
+    {
+        var services = _ws.Services;
+        int local = services.Count(s => s.IsLocal);
+        int startable = services.Count(s => s.IsLocal && !s.IsActive && !s.InVisualStudio);
+        int lastCount = services.Count(s => _ws.Settings.LastLocalServices.Contains(s.ProjectFilePath, StringComparer.OrdinalIgnoreCase));
+
+        _startLocal.Text = startable > 0 ? $"Start {startable} local" : "Start local";
+        _startLocal.Enabled = startable > 0;
+        _stopAll.Enabled = local > 0 || services.Any(s => s.IsActive);
+
+        bool showLast = local == 0 && lastCount > 0;
+        _lastSession.Text = $"Last session ({lastCount})";
+        if (_lastSession.Visible != showLast) _lastSession.Visible = showLast;
+        _tips.SetToolTip(_lastSession, "Tick and start the services you had running last time");
+        LayoutToolbar();
+    }
+
+    private void UpdateTotals()
+    {
+        var running = _ws.Services.Where(s => s.IsActive).ToList();
+        double cpu = running.Sum(s => s.CpuPercent);
+        long memory = running.Sum(s => s.MemoryBytes);
+        string summary = running.Count == 0
+            ? $"{_ws.Services.Count} services · nothing running · remote: {_ws.CurrentProfile.Name}"
+            : $"{running.Count(s => s.State == ServiceState.Running)} running · {cpu:0}% CPU · {Theme.Bytes(memory)}";
+        _status.SetTotals(summary, $"Manager {Theme.Bytes(_ws.ManagerMemoryBytes)}");
+    }
+
+    // ================================================================== logs panel
+
+    private void ShowLogsFor(ServiceInfo? svc)
+    {
+        if (svc is null) { ShowActivity(true); return; }
+        _showActivity = false;
+        _log.Buffer = svc.Log;
+        UpdateLogHeader();
+    }
+
+    private void ShowActivity(bool show)
+    {
+        _showActivity = show || _list.Selected is null;
+        _log.Buffer = _showActivity ? _ws.ActivityLog : _list.Selected!.Log;
+        UpdateLogHeader();
+    }
+
+    private void UpdateLogHeader()
+    {
+        _logHeader.Activity.Toggled = _showActivity;
+        if (_showActivity || _list.Selected is not { } svc)
         {
-            if (e.Button == MouseButtons.Right)
-            {
-                int index = clbServices.IndexFromPoint(e.Location);
-                if (index != ListBox.NoMatches) clbServices.SelectedIndex = index;
-            }
+            _logHeader.Set("Activity", "What the manager changed and why", Theme.Accent);
+            _log.EmptyText = "Nothing yet.";
+            return;
+        }
+        string sub = Theme.StateText(svc, _ws.CurrentProfile.Name);
+        if (svc.IsActive || svc.InVisualStudio) sub += "  ·  " + svc.LocalUrl;
+        if (svc.Log.ErrorCount > 0) sub += $"  ·  {svc.Log.ErrorCount} error line(s)";
+        _logHeader.Set(svc.Name, sub, Theme.StateColor(svc));
+        _log.EmptyText = svc.IsActive ? "Waiting for output…" : "Press ▶ to start this service here — its output appears in this panel.";
+    }
+
+    private void ClearShownLog()
+    {
+        _log.Buffer?.Clear();
+        _log.Poll();
+    }
+
+    // ================================================================== actions
+
+    private void StartLocal()
+    {
+        if (!_ws.Services.Any(s => s.IsLocal))
+        {
+            _status.SetNotice("Tick the services you want to run locally first (or press ▶ on a row).", false);
+            return;
+        }
+        Guard(_ws.StartLocalServices);
+    }
+
+    private async void OnRowAction(ServiceInfo svc, RowAction action, Point location)
+    {
+        switch (action)
+        {
+            case RowAction.StartStop:
+                if (svc.IsActive) await GuardAsync(() => _ws.StopAsync(svc));
+                else { Guard(() => _ws.Start(svc)); ShowLogsFor(svc); }
+                break;
+            case RowAction.Restart:
+                ShowLogsFor(svc);
+                await GuardAsync(() => _ws.RestartAsync(svc));
+                break;
+            case RowAction.Browse:
+                OpenShell(svc.BrowseUrl);
+                break;
+            case RowAction.More:
+                ShowRowMenu(svc, location);
+                break;
+        }
+    }
+
+    private void ShowRowMenu(ServiceInfo svc, Point location)
+    {
+        _rowMenu.Items.Clear();
+        ToolStripMenuItem Add(string text, Action onClick, bool enabled = true)
+        {
+            var item = new ToolStripMenuItem(text) { Enabled = enabled, ForeColor = Theme.Text, Font = Theme.Ui(9.5f), Padding = new Padding(2, 5, 2, 5) };
+            item.Click += (_, _) => onClick();
+            _rowMenu.Items.Add(item);
+            return item;
         }
 
-        // Handle opening in Visual Studio
-        private void OpenVsItem_Click(object? sender, EventArgs e)
+        Add(svc.IsActive ? "Stop" : "Start here", () => OnRowAction(svc, RowAction.StartStop, location));
+        Add("Restart", () => OnRowAction(svc, RowAction.Restart, location),
+            svc.State is ServiceState.Running or ServiceState.Starting or ServiceState.Crashed);
+        Add("Open in browser", () => OpenShell(svc.BrowseUrl), svc.State == ServiceState.Running || svc.InVisualStudio);
+        Add("Open in Visual Studio", async () => await GuardAsync(() => _ws.OpenInVisualStudioAsync(svc)));
+        _rowMenu.Items.Add(new ToolStripSeparator());
+        Add(svc.IsLocal ? $"Point Angular back at {_ws.CurrentProfile.Name}" : "Point Angular here without starting",
+            () => Guard(() => _ws.SetLocal(svc, !svc.IsLocal)));
+        Add("Set environment key…", () => PickEnvKey(svc));
+        Add("Copy local URL", () => { try { Clipboard.SetText(svc.LocalUrl); } catch { } });
+        Add("Open project folder", () => OpenShell(svc.ProjectDirectory));
+        _rowMenu.Items.Add(new ToolStripSeparator());
+        Add("Clear output", () => { svc.Log.Clear(); _log.Poll(); });
+
+        _rowMenu.Show(_list, location);
+    }
+
+    private void PickEnvKey(ServiceInfo svc)
+    {
+        using var dialog = new KeyPickerForm(svc, _ws);
+        if (dialog.ShowDialog(this) == DialogResult.OK) Guard(() => _ws.SetEnvKey(svc, dialog.SelectedKey));
+    }
+
+    private void CommitDatabase()
+    {
+        if (!_initialized) return;
+        if (_ws.SetDatabase(_database.Text, out string? error))
         {
-            if (clbServices.SelectedIndex == -1) return;
-            var svc = _services[clbServices.SelectedIndex];
-            string selectedEnv = rbUat.Checked ? "UAT" : "QA";
-
-            _settings.DatabaseName = txtDatabase.Text;
-            _settings.RemoteEnvironment = selectedEnv;
-            _settingsManager.SaveSettings(_settings);
-
-            _processManager.StopService(svc); // Stop CMD if it's already running
-
-            svc.OpenedInVs = true;
-            svc.IsLocalSelected = true;
-            svc.Status = "● VISUAL STUDIO";
-
-            _databaseManager.UpdateConnectionString(svc, txtDatabase.Text);
-            _envManager.ApplyChanges(_services.ToList(), selectedEnv);
-
-            try
-            {
-                // This utilizes the Windows Default Program association for .csproj files
-                Process.Start(new ProcessStartInfo { FileName = svc.ProjectFilePath, UseShellExecute = true });
-                lblStatus.Text = $"✓ Opened {svc.Name} in Visual Studio. Database and environment updated.";
-            }
-            catch (Exception ex)
-            {
-                lblStatus.Text = $"❌ Failed to open Visual Studio: {ex.Message}";
-            }
-
-            UpdateListboxItem(svc);
+            _database.HasError = false;
+            _database.Text = _ws.Settings.DatabaseName;
         }
-
-        private void BtnApplyRun_Click(object? sender, EventArgs e)
+        else
         {
-            int started = 0, stopped = 0;
-            string selectedEnv = rbUat.Checked ? "UAT" : "QA";
+            _database.HasError = true;
+            _status.SetNotice("Database name: " + error, true);
+        }
+    }
 
-            _settings.DatabaseName = txtDatabase.Text;
-            _settings.RemoteEnvironment = selectedEnv;
-            _settingsManager.SaveSettings(_settings);
+    private void Rescan()
+    {
+        if (!_initialized) return;
+        Guard(() =>
+        {
+            _ws.Rescan();
+            _status.SetNotice($"Found {_ws.Services.Count} services.", false);
+        });
+    }
 
-            foreach (var svc in _services)
+    private async void OpenSettings()
+    {
+        var settings = _ws.Settings;
+        using var dialog = new SettingsForm(settings, firstRun: false);
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+
+        bool pathsChanged = !string.Equals(settings.EnvFilePath, dialog.EnvFilePath, StringComparison.OrdinalIgnoreCase)
+                            || !string.Equals(settings.MicroservicesRootPath, dialog.ServicesRoot, StringComparison.OrdinalIgnoreCase);
+        if (pathsChanged)
+        {
+            int active = _ws.Services.Count(s => s.IsActive);
+            if (active > 0 && MessageBox.Show(this, $"Changing folders stops the {active} running service(s). Continue?",
+                    "Settings", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+                return;
+
+            // ReloadAsync puts back every file it changed (by their recorded paths) before scanning the new folder.
+            settings.EnvFilePath = dialog.EnvFilePath;
+            settings.MicroservicesRootPath = dialog.ServicesRoot;
+            SettingsStore.Save(settings);
+            _list.Selected = null;
+            await GuardAsync(_ws.ReloadAsync);
+            _header.Subtitle = settings.MicroservicesRootPath;
+            PopulateEnvironments();
+            _status.SetNotice($"Settings saved. Found {_ws.Services.Count} services.", false);
+        }
+        else
+        {
+            SettingsStore.Save(settings);
+            _status.SetNotice("Settings saved. Run settings apply the next time a service starts.", false);
+        }
+        RefreshUi(force: true);
+    }
+
+    private void OpenShell(string target)
+    {
+        try { Process.Start(new ProcessStartInfo(target) { UseShellExecute = true })?.Dispose(); }
+        catch (Exception ex) { _status.SetNotice($"Couldn't open {target}: {ex.Message}", true); }
+    }
+
+    private void Guard(Action action)
+    {
+        try { action(); }
+        catch (Exception ex) { _status.SetNotice(ex.Message, true); }
+        RefreshUi(force: true);
+    }
+
+    private async Task GuardAsync(Func<Task> action)
+    {
+        try { await action(); }
+        catch (Exception ex) { _status.SetNotice(ex.Message, true); }
+        RefreshUi(force: true);
+    }
+
+    public void ShowError(Exception ex) => _status.SetNotice("Unexpected error: " + ex.Message, true);
+
+    // ================================================================== keyboard
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        switch (keyData)
+        {
+            case Keys.Control | Keys.F:
+                _search.SelectAllText();
+                return true;
+            case Keys.F5:
+                Rescan();
+                return true;
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    // ================================================================== window placement & closing
+
+    private void RestorePlacement()
+    {
+        var p = _ws.Settings.Window;
+        if (p is null || p.Width < 400 || p.Height < 300) return;
+        var bounds = new Rectangle(p.X, p.Y, p.Width, p.Height);
+        if (!Screen.AllScreens.Any(s => s.WorkingArea.IntersectsWith(bounds))) return;
+        StartPosition = FormStartPosition.Manual;
+        Bounds = bounds;
+        if (p.Maximized) WindowState = FormWindowState.Maximized;
+    }
+
+    private void ApplySavedSplitter()
+    {
+        int logHeight = _ws.Settings.Window?.LogPanelHeight ?? 0;
+        if (logHeight <= 0) logHeight = (int)(_split.Height * 0.38);
+        int distance = _split.Height - logHeight - _split.SplitterWidth;
+        if (distance > _split.Panel1MinSize && distance < _split.Height - _split.Panel2MinSize)
+            _split.SplitterDistance = distance;
+    }
+
+    private void SavePlacement()
+    {
+        var b = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+        _ws.Settings.Window = new WindowPlacement
+        {
+            X = b.X, Y = b.Y, Width = b.Width, Height = b.Height,
+            Maximized = WindowState == FormWindowState.Maximized,
+            LogPanelHeight = _split.Height - _split.SplitterDistance - _split.SplitterWidth,
+        };
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (!_closing && _initialized)
+        {
+            int active = _ws.Services.Count(s => s.IsActive);
+            if (active > 0 && e.CloseReason == CloseReason.UserClosing)
             {
-                if (svc.IsLocalSelected)
+                var answer = MessageBox.Show(this,
+                    $"{active} service(s) are still running.\n\nStop them and put environment.ts and appsettings back to your repo's values?",
+                    "Close Microservice Manager", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (answer != DialogResult.Yes)
                 {
-                    _databaseManager.UpdateConnectionString(svc, txtDatabase.Text);
-
-                    // Skip starting CMD if the user is debugging it in Visual Studio
-                    if (!svc.OpenedInVs && (svc.RunningProcess == null || svc.RunningProcess.HasExited))
-                    {
-                        _processManager.StartService(svc);
-                        started++;
-                    }
+                    e.Cancel = true;
+                    return;
                 }
-                else
-                {
-                    svc.OpenedInVs = false; // Reset VS flag if they uncheck it
-                    _databaseManager.RestoreOriginal(svc);
-
-                    if (svc.RunningProcess != null && !svc.RunningProcess.HasExited)
-                    {
-                        _processManager.StopService(svc);
-                        stopped++;
-                    }
-                    else if (svc.Status == "● VISUAL STUDIO")
-                    {
-                        svc.Status = "○ STOPPED";
-                    }
-                }
-                UpdateListboxItem(svc);
             }
-
-            _envManager.ApplyChanges(_services.ToList(), selectedEnv);
-            lblStatus.Text = $"✓ Applied. {started} started in CMD, {stopped} stopped/reverted.";
         }
 
-        private void BtnStopAll_Click(object? sender, EventArgs e)
+        _closing = true;
+        _uiTimer.Stop();
+        _metricsTimer.Stop();
+        _profilesWatcher?.Dispose();
+        SavePlacement();
+        _ws.Shutdown();
+        base.OnFormClosing(e);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
         {
-            string selectedEnv = rbUat.Checked ? "UAT" : "QA";
-
-            foreach (var svc in _services)
-            {
-                _processManager.StopService(svc);
-                _databaseManager.RestoreOriginal(svc);
-                svc.IsLocalSelected = false;
-                svc.OpenedInVs = false;
-                if (svc.Status == "● VISUAL STUDIO") svc.Status = "○ STOPPED";
-                UpdateListboxItem(svc);
-            }
-
-            _envManager.ApplyChanges(_services.ToList(), selectedEnv);
-            lblStatus.Text = $"All services stopped.\n✓ environment.ts and all appsettings.json files reverted to normal.";
+            _uiTimer.Dispose();
+            _metricsTimer.Dispose();
+            _rowMenu.Dispose();
+            _tips.Dispose();
         }
-
-        private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
-        {
-            string selectedEnv = rbUat.Checked ? "UAT" : "QA";
-
-            foreach (var svc in _services)
-            {
-                _processManager.StopService(svc);
-                _databaseManager.RestoreOriginal(svc);
-            }
-
-            _envManager.ApplyChanges(new List<Microservice>(), selectedEnv);
-        }
+        base.Dispose(disposing);
     }
 }
